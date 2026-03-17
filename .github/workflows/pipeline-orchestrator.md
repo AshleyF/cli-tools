@@ -85,62 +85,82 @@ Dispatch the `issue-implementer` workflow for the **first** eligible issue only 
 
 If no issues need implementation, move on to Step 2.
 
-### Step 2: Find stuck PRs
+### Step 2: Gather all PR state in one query
 
-List all open PRs with the `aw` label that have auto-merge enabled. Exclude any PR labeled `aw-conflict` (merge conflicts, needs manual intervention).
-
-If there are no issues to dispatch and no stuck PRs, stop with a noop.
-
-Sort PRs by progress: approved PRs first (closest to merging), then unapproved.
-
-### Step 3: Process each PR
-
-For each PR (in sorted order), gather its state:
-- `mergeStateStatus` (BEHIND, CLEAN, BLOCKED, etc.)
-- `reviewDecision` (APPROVED, REVIEW_REQUIRED, etc.)
-- Whether Copilot has submitted a review (look for reviews by author `copilot-pull-request-reviewer`)
-- Whether the latest CI check run (`check` job) has failed
-- Whether the PR has the `ci-fix-attempted` label
-
-Then apply the **first matching** action and move to the next PR:
-
-#### Action 1: Request Copilot review
-
-If Copilot has not reviewed this PR yet, request a review from `@copilot` using the add-reviewer safe-output. Stop processing this PR — the pipeline will continue from here next cycle.
-
-#### Action 2: Resolve unresolved threads
-
-Query the PR's review threads using bash:
+Run a single GraphQL query to get everything about open `aw`-labeled PRs. Use `$GITHUB_MCP_SERVER_TOKEN` for authentication:
 ```
-gh api graphql -f query='query($owner: String!, $name: String!, $pr: Int!) {
+GH_TOKEN="$GITHUB_MCP_SERVER_TOKEN" gh api graphql -f query='query($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
-    pullRequest(number: $pr) {
-      reviewThreads(first: 100) {
-        nodes {
-          id
-          isResolved
-          comments(last: 1) {
-            nodes { author { login } }
+    pullRequests(first: 10, states: OPEN, labels: ["aw"]) {
+      nodes {
+        number
+        headRefName
+        mergeStateStatus
+        reviewDecision
+        autoMergeRequest { enabledAt }
+        labels(first: 10) { nodes { name } }
+        reviews(first: 10) { nodes { author { login } state } }
+        reviewThreads(first: 100) {
+          nodes {
+            id
+            isResolved
+            comments(last: 1) {
+              nodes { author { login } }
+            }
+          }
+        }
+        commits(last: 1) {
+          nodes {
+            commit {
+              statusCheckRollup {
+                contexts(first: 20) {
+                  ... on CheckRun { name conclusion }
+                }
+              }
+            }
           }
         }
       }
     }
   }
-}' -f owner="$GITHUB_REPOSITORY_OWNER" -f name="${GITHUB_REPOSITORY#*/}" -F pr=PR_NUMBER
+}' -f owner="$GITHUB_REPOSITORY_OWNER" -f name="${GITHUB_REPOSITORY#*/}"
 ```
-Replace `PR_NUMBER` with the actual PR number.
 
-For each unresolved thread, check the last comment's author. The review-responder posts replies using a PAT owned by the repository owner, so its comments appear as the value of `$GITHUB_REPOSITORY_OWNER`. Check this environment variable to determine the responder's identity.
+From this single response, extract for each PR:
+- Whether it has auto-merge enabled (skip if not)
+- Whether it has the `aw-conflict` label (skip if yes)
+- `mergeStateStatus`
+- `reviewDecision`
+- Whether any review is from `copilot-pull-request-reviewer`
+- All unresolved thread IDs (`PRRT_` format) and the last comment author on each
+- Whether the `check` CI job has conclusion `failure`
+- Whether it has the `ci-fix-attempted` label
 
-If the last comment was posted by the responder (PAT owner) or by `github-actions[bot]`, resolve the thread using the resolve-pull-request-review-thread safe-output.
+Sort PRs by progress: approved first, then unapproved.
 
-If any unresolved threads remain where the last commenter is someone else (human or Copilot reviewer), stop processing this PR — it needs attention.
+### Step 3: Process each PR
+
+For each PR (in sorted order), apply the actions below **in this exact order**. Apply only the **first matching** action, then move to the next PR:
+
+#### Action 1: Request Copilot review
+
+If no review from `copilot-pull-request-reviewer` exists in the reviews list, request a review from `@copilot` using the add-reviewer safe-output. Stop processing this PR.
+
+#### Action 2: Resolve unresolved threads
+
+If any review threads have `isResolved: false`, check the last comment's author on each. The review-responder posts replies as the value of `$GITHUB_REPOSITORY_OWNER` (the repository owner).
+
+For each unresolved thread where the last comment author matches `$GITHUB_REPOSITORY_OWNER` or `github-actions[bot]`, resolve it using the resolve-pull-request-review-thread safe-output with the thread's `id` field.
+
+If any unresolved threads remain where the last commenter is someone else (Copilot reviewer, human), stop processing this PR — it needs attention.
+
+**This action takes priority over "behind main" — always resolve threads first, even if the PR is behind main.**
 
 #### Action 3: CI failure
 
-If the latest CI `check` run has failed and the PR does NOT have the `ci-fix-attempted` label, dispatch the `ci-fixer` workflow with the PR number as input. The ci-fixer will read the logs, fix the issues, and push. Stop processing this PR — next cycle will check again.
+If the `check` job has conclusion `failure` and the PR does NOT have the `ci-fix-attempted` label, dispatch the `ci-fixer` workflow with the PR number as input. Stop processing this PR.
 
-If CI has failed but the PR already has `ci-fix-attempted`, skip — the fixer already tried once and manual intervention is needed.
+If CI failed but the PR already has `ci-fix-attempted`, skip — manual intervention needed.
 
 #### Action 4: Behind main
 
